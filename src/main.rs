@@ -4,7 +4,6 @@ use std::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::{anyhow, Context, Error};
-use url::Url;
 
 use nostr_sdk::prelude::*;
 
@@ -22,28 +21,6 @@ use nostr_sdk::prelude::*;
 
 // Private Direct Messages
 // https://github.com/nostr-protocol/nips/blob/master/17.md
-
-struct MetadataVar {
-    name: Option<String>,
-    display_name: Option<String>,
-    about: Option<String>,
-    website: Option<String>,
-    picture: Option<String>,
-    banner: Option<String>
-}
-
-impl Default for MetadataVar {
-    fn default() -> Self {
-        Self {
-            name: None,
-            display_name: None,
-            about: None,
-            website: None,
-            picture: None,
-            banner: None
-        }
-    }
-}
 
 fn timeout_get() -> Duration {
     Duration::from_secs(60)
@@ -99,36 +76,10 @@ fn event_print(
     Ok(())
 }
 
-async fn events_fetch(
-    filter: Filter, relays: Vec<String>
-) -> Result<Events, Error> {
-    let timeout = timeout_get();
-
-    let client = Client::builder()
-        .opts(ClientOptions::new()
-            .gossip(false)
-            .connection(Connection::new().proxy(tor_socket_get()))
-        ).build();
-
-    for relay in relays {
-        client.add_relay(relay).await?;
-    }
-    for (key, value) in client.try_connect(timeout).await.failed {
-        println!("{key} connecting {value}");
-    }
-
-    let events: Events = client
-        .fetch_events(filter, timeout)
-        .await?;
-
-    client.disconnect().await;
-
-    Ok(events)
-}
-
-async fn event_send(
-    event: Event, relays: Vec<String>
-) -> Result<(), Error> {
+// create client with tor, connect it to the relays and return it
+async fn client_connected_relays_get(
+    relays: Vec<String>
+) -> Result<Client, Error> {
     let timeout = timeout_get();
 
     let client = Client::builder()
@@ -144,6 +95,30 @@ async fn event_send(
         eprintln!("error: {key} connecting {value}");
     }
 
+    Ok(client)
+}
+
+async fn events_fetch(
+    filter: Filter, relays: Vec<String>
+) -> Result<Events, Error> {
+    let timeout = timeout_get();
+
+    let client = client_connected_relays_get(relays).await?;
+
+    let events: Events = client
+        .fetch_events(filter, timeout)
+        .await?;
+
+    client.disconnect().await;
+
+    Ok(events)
+}
+
+async fn event_send(
+    event: Event, relays: Vec<String>
+) -> Result<(), Error> {
+    let client = client_connected_relays_get(relays).await?;
+
     for (key, value) in client.send_event(&event).await?.failed {
         eprintln!("error: {key} sending event {value}");
     }
@@ -156,28 +131,8 @@ async fn event_send(
 }
 
 fn metadata_event(
-    mtv: MetadataVar, private_key: &str
+    metadata: Metadata, private_key: &str
 ) -> Result<(), Error> {
-    let mut metadata = Metadata::new();
-    if let Some(name) = mtv.name {
-        metadata = metadata.name(name);
-    }
-    if let Some(display_name) = mtv.display_name {
-        metadata = metadata.display_name(display_name);
-    }
-    if let Some(about) = mtv.about {
-        metadata = metadata.about(about);
-    }
-    if let Some(website) = mtv.website {
-        metadata = metadata.website(Url::parse(&website)?);
-    }
-    if let Some(picture) = mtv.picture {
-        metadata = metadata.picture(Url::parse(&picture)?);
-    }
-    if let Some(banner) = mtv.banner {
-        metadata = metadata.banner(Url::parse(&banner)?);
-    }
-
     let keys = Keys::parse(private_key)?;
     let event = EventBuilder::metadata(&metadata).sign_with_keys(&keys)?;
 
@@ -244,30 +199,42 @@ async fn relay_list_fetch(
     Ok(())
 }
 
+fn arg_relay_array(current_parameter: usize) -> Result<Vec<String>, Error> {
+    let relays: Vec<String> = serde_json::from_str(
+        &std::env::args().nth(current_parameter)
+            .ok_or(anyhow!("insert relays array"))?
+    ).with_context(|| "parsing relays array")?;
+
+    Ok(relays)
+}
+
 async fn handle_arguments() -> Result<(), Error> {
-    let mut current_parameter = 1;
+    let mut current_parameter: usize = 1;
     match std::env::args().nth(current_parameter).as_deref() {
         Some(arg) => match arg {
             "-h" | "--help" => {
                 print!(
 r#"nmini action
 
+actions:
 <event> | event-send <relays>
-<nsec> | metadata-event --[name|display-name|about|website|picture|banner]=<value> <relays>
+<private-key> | metadata-event <metadata-json>
 metadata-fetch <public-key> <relays>
-<nsec> | relay-list-event [standard|inbox] <relays>
+<private-key> | relay-list-event [standard|inbox] <relays>
 relay-list-fetch [all|standard|inbox] <public-key> <relays>
+
+args:
+metadata-json and relays are parsed as json
+metadata-json is an object that is parsed as metadata (nip-01, nip-24)
+relays is an array of string urls
+private-key and public-key can be hex or bech32
+event is a signed json nostr event
 "#
                 );
             },
             "event-send" => {
-                let mut relays = Vec::new();
-                while std::env::args().len() - current_parameter > 1 {
-                    current_parameter += 1;
-                    let relay = std::env::args().nth(current_parameter)
-                        .ok_or(anyhow!("insert relay"))?;
-                    relays.push(relay);
-                }
+                current_parameter += 1;
+                let relays = arg_relay_array(current_parameter)?;
 
                 let event = Event::from_json(
                     utils::read_stdin_pipe()
@@ -277,63 +244,26 @@ relay-list-fetch [all|standard|inbox] <public-key> <relays>
                 event_send(event, relays).await?;
             },
             "metadata-event" => {
-                let mut mtv = MetadataVar::default();
-
-                while std::env::args().len() - current_parameter > 1 {
-                    current_parameter += 1;
-                    let current_arg = std::env::args().nth(current_parameter)
-                        .ok_or(anyhow!("insert argument"))?;
-
-                    if ! current_arg.starts_with("--") {
-                        // uncomment in case other arguments should be read
-                        // current_parameter -= 1;
-                        break
-                    }
-
-                    let full_option: Vec<&str> = current_arg.split('=').collect();
-                    if full_option.len() < 2 {
-                        return Err(anyhow!("argument {current_arg} not valid"));
-                    }
-                    let option_first_part = full_option[0];
-                    let option_second_part = full_option[1];
-                    let variable_to_set = match option_first_part {
-                        "--name" => &mut mtv.name,
-                        "--display_name" => &mut mtv.display_name,
-                        "--about" => &mut mtv.about,
-                        "--website" => &mut mtv.website,
-                        "--picture" => &mut mtv.picture,
-                        "--banner" => &mut mtv.banner,
-                        _ => return Err(anyhow!(
-                            "argument {current_arg} {option_first_part} not valid"
-                        ))
-                    };
-                    if (*variable_to_set).is_some() {
-                        return Err(anyhow!(
-                            "{option_first_part} set multiple times")
-                        );
-                    }
-                    *variable_to_set = Some(option_second_part.to_owned());
-                }
+                current_parameter += 1;
+                let metadata = Metadata::from_json(
+                    &std::env::args().nth(current_parameter)
+                        .ok_or(anyhow!("insert metadata json"))?
+                ).with_context(|| "parsing metadata json")?;
 
                 let private_key = utils::read_stdin_pipe()
                     .with_context(|| "reading private key in stdin")?
                     .trim()
                     .to_owned();
 
-                metadata_event(mtv, &private_key)?;
+                metadata_event(metadata, &private_key)?;
             },
             "metadata-fetch" => {
                 current_parameter += 1;
                 let public_key = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert public key"))?;
 
-                let mut relays = Vec::new();
-                while std::env::args().len() - current_parameter > 1 {
-                    current_parameter += 1;
-                    let relay = std::env::args().nth(current_parameter)
-                        .ok_or(anyhow!("insert relay"))?;
-                    relays.push(relay);
-                }
+                current_parameter += 1;
+                let relays = arg_relay_array(current_parameter)?;
 
                 metadata_fetch(&public_key, relays).await?;
             },
@@ -348,13 +278,8 @@ relay-list-fetch [all|standard|inbox] <public-key> <relays>
                     ))
                 };
 
-                let mut relays = Vec::new();
-                while std::env::args().len() - current_parameter > 1 {
-                    current_parameter += 1;
-                    let relay = std::env::args().nth(current_parameter)
-                        .ok_or(anyhow!("insert relay"))?;
-                    relays.push(relay);
-                }
+                current_parameter += 1;
+                let relays = arg_relay_array(current_parameter)?;
 
                 let private_key = utils::read_stdin_pipe()
                     .with_context(|| "reading private key in stdin")?
@@ -379,13 +304,8 @@ relay-list-fetch [all|standard|inbox] <public-key> <relays>
                 let public_key = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert public key"))?;
 
-                let mut relays = Vec::new();
-                while std::env::args().len() - current_parameter > 1 {
-                    current_parameter += 1;
-                    let relay = std::env::args().nth(current_parameter)
-                        .ok_or(anyhow!("insert relay"))?;
-                    relays.push(relay);
-                }
+                current_parameter += 1;
+                let relays = arg_relay_array(current_parameter)?;
 
                 relay_list_fetch(relay_type, &public_key, relays).await?;
             },
