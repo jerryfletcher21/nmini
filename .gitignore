@@ -1,0 +1,10 @@
+# editor
+.exrc
+.nexrc
+tags
+
+# personal
+/saved/
+
+# rust
+/target
