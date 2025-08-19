@@ -34,46 +34,56 @@ fn tor_socket_get() -> SocketAddr {
     )
 }
 
-fn event_print(
-    event: &Event
+fn unsigned_event_print(
+    event: UnsignedEvent, extra_fields: Option<indexmap::IndexMap<String, Value>>
 ) -> Result<(), Error> {
-    let mut metadata_json = indexmap::IndexMap::new();
+    let mut event_json = indexmap::IndexMap::<String, Value>::new();
 
-    metadata_json.insert(
+    event_json.insert(
         format!("kind"),
         serde_json::json!(event.kind)
     );
 
-    metadata_json.insert(
+    event_json.insert(
         format!("created_at"),
         serde_json::json!(utils::unix_timestamp_s_to_string(
             event.created_at.as_u64())?
         )
     );
 
-    metadata_json.insert(
+    event_json.insert(
         format!("content"),
         serde_json::from_str::<serde_json::Value>(&event.content)
             .unwrap_or_else(|_| serde_json::json!(&event.content))
     );
 
-    metadata_json.insert(
+    event_json.insert(
         format!("tags"),
         serde_json::json!(event.tags.as_slice())
     );
+
+    if let Some(extra_fields) = extra_fields {
+        event_json.extend(extra_fields);
+    }
 
 //    let mut tags: Vec<Vec<String>> = Vec::new();
 //    for tag in event.tags.as_slice() {
 //        tags.push((&tag.as_slice()[1..]).to_vec());
 //    }
-//    metadata_json.insert(
+//    event_json.insert(
 //        format!("relays"),
 //        serde_json::json!(tags)
 //    );
 
-    println!("{}", utils::json_to_string_pretty(&metadata_json));
+    println!("{}", utils::json_to_string_pretty(&event_json));
 
     Ok(())
+}
+
+fn event_print(
+    event: Event
+) -> Result<(), Error> {
+    unsigned_event_print(event.into(), None)
 }
 
 // create client with tor, connect it to the relays and return it
@@ -146,14 +156,14 @@ async fn metadata_fetch(
 ) -> Result<(), Error> {
     let metadata_kind = Kind::Metadata;
 
-    let filter: Filter = Filter::default()
+    let filter: Filter = Filter::new()
         .authors([PublicKey::parse(public_key)?])
         .kinds([metadata_kind]);
 
     let events = events_fetch(filter, relays).await?;
 
     for event in events.to_vec() {
-        event_print(&event)?;
+        event_print(event)?;
     }
 
     Ok(())
@@ -186,14 +196,73 @@ fn relay_list_event(
 async fn relay_list_fetch(
     kinds: Vec<Kind>, public_key: &str, relays: Vec<String>
 ) -> Result<(), Error> {
-    let filter: Filter = Filter::default()
+    let filter: Filter = Filter::new()
         .authors([PublicKey::parse(public_key)?])
         .kinds(kinds);
 
     let events = events_fetch(filter, relays).await?;
 
     for event in events.to_vec() {
-        event_print(&event)?;
+        event_print(event)?;
+    }
+
+    Ok(())
+}
+
+// https://github.com/nostr-protocol/nips/blob/master/17.md
+//
+// TODO: support tags:
+// ["e", "<kind-14-id>", "<relay-url>"] // if this is a reply
+// ["subject", "<conversation-title>"]
+// ["q", "<event-id> or <event-address>", "<relay-url>", "<pubkey-if-a-regular-event>"]
+//
+// TODO: support Kind::Custom(15)
+async fn dm_event(
+    private_key: &str, receiver_public_key: &str, message: &str
+) -> Result<(), Error> {
+    let keys = Keys::parse(private_key)?;
+    let receiver = PublicKey::parse(receiver_public_key)?;
+
+    let rumor: UnsignedEvent = EventBuilder::new(Kind::Custom(14), message)
+        .tags([Tag::public_key(receiver)])
+        .build(keys.public_key());
+
+    let event: Event = EventBuilder::gift_wrap(
+        &keys, &receiver, rumor, []
+    ).await?;
+
+    println!("{}", event.as_pretty_json());
+
+    Ok(())
+}
+
+// should be renamed gift_wraps_fetch then maybe an other function specific for
+// nip-17 private direct messages
+async fn dm_fetch(
+    private_key: &str, relays: Vec<String>
+) -> Result<(), Error> {
+    let keys = Keys::parse(private_key)?;
+
+    let filter: Filter = Filter::new()
+        .kind(Kind::GiftWrap)
+        .pubkey(keys.public_key());
+
+    let events = events_fetch(filter, relays).await?;
+
+    for event in events.to_vec() {
+        if event.kind == Kind::GiftWrap {
+            let UnwrappedGift { sender, rumor } =
+                UnwrappedGift::from_gift_wrap(&keys, &event).await?;
+
+            let mut extra_fields = indexmap::IndexMap::<String, Value>::new();
+            extra_fields.insert(
+                format!("sender"),
+                serde_json::json!(sender.to_hex())
+            );
+
+            // TODO: handle Kind::Custom(15) better
+            unsigned_event_print(rumor, Some(extra_fields))?;
+        }
     }
 
     Ok(())
@@ -222,6 +291,8 @@ actions:
 metadata-fetch <public-key> <relays>
 <private-key> | relay-list-event [standard|inbox] <relays>
 relay-list-fetch [all|standard|inbox] <public-key> <relays>
+<private-key> | dm-event <public-key> <message>
+<private-key> | dm-fetch <relays>
 
 args:
 metadata-json and relays are parsed as json
@@ -308,6 +379,33 @@ event is a signed json nostr event
                 let relays = arg_relay_array(current_parameter)?;
 
                 relay_list_fetch(relay_type, &public_key, relays).await?;
+            },
+            "dm-event" => {
+                current_parameter += 1;
+                let receiver_public_key = std::env::args().nth(current_parameter)
+                    .ok_or(anyhow!("insert receiver public key"))?;
+
+                current_parameter += 1;
+                let message = std::env::args().nth(current_parameter)
+                    .ok_or(anyhow!("insert message"))?;
+
+                let private_key = utils::read_stdin_pipe()
+                    .with_context(|| "reading private key in stdin")?
+                    .trim()
+                    .to_owned();
+
+                dm_event(&private_key, &receiver_public_key, &message).await?;
+            },
+            "dm-fetch" => {
+                current_parameter += 1;
+                let relays = arg_relay_array(current_parameter)?;
+
+                let private_key = utils::read_stdin_pipe()
+                    .with_context(|| "reading private key in stdin")?
+                    .trim()
+                    .to_owned();
+
+                dm_fetch(&private_key, relays).await?;
             },
             _ => return Err(anyhow!("argument {arg} not recognized"))
         },
