@@ -22,15 +22,22 @@ use nostr_sdk::prelude::*;
 // Private Direct Messages
 // https://github.com/nostr-protocol/nips/blob/master/17.md
 
+type JsonOrdered = indexmap::IndexMap<String, serde_json::Value>;
+
 fn timeout_get() -> Duration {
     Duration::from_secs(60)
 }
 
 fn unsigned_event_print(
     event: UnsignedEvent,
-    extra_fields: Option<indexmap::IndexMap<String, serde_json::Value>>
+    extra_fields: Option<JsonOrdered>
 ) -> Result<(), Error> {
-    let mut event_json = indexmap::IndexMap::<String, serde_json::Value>::new();
+    let mut event_json = JsonOrdered::new();
+
+    event_json.insert(
+        format!("id"),
+        serde_json::json!(event.id)
+    );
 
     event_json.insert(
         format!("kind"),
@@ -39,9 +46,12 @@ fn unsigned_event_print(
 
     event_json.insert(
         format!("created_at"),
-        serde_json::json!(utils::unix_timestamp_s_to_string(
-            event.created_at.as_u64())?
-        )
+        serde_json::json!({
+            "timestamp": event.created_at.as_u64(),
+            "date": serde_json::json!(
+                utils::unix_timestamp_s_to_string(event.created_at.as_u64())?
+            )
+        })
     );
 
     event_json.insert(
@@ -81,7 +91,7 @@ fn event_print(
 
 // create client with tor, connect it to the relays and return it
 async fn client_connected_relays_get(
-    relays: Vec<String>
+    relays_list: &Vec<Vec<String>>
 ) -> Result<Client, Error> {
     let timeout = timeout_get();
 
@@ -95,8 +105,10 @@ async fn client_connected_relays_get(
             .connection(Connection::new().proxy(tor_socket))
         ).build();
 
-    for relay in relays {
-        client.add_relay(relay).await?;
+    for relays in relays_list {
+        for relay in relays {
+            client.add_relay(relay).await?;
+        }
     }
     for (key, value) in client.try_connect(timeout).await.failed {
         eprintln!("error: {key} connecting {value}");
@@ -110,7 +122,7 @@ async fn events_fetch_filter(
 ) -> Result<Events, Error> {
     let timeout = timeout_get();
 
-    let client = client_connected_relays_get(relays).await?;
+    let client = client_connected_relays_get(&vec![relays]).await?;
 
     let events: Events = client
         .fetch_events(filter, timeout)
@@ -121,16 +133,33 @@ async fn events_fetch_filter(
     Ok(events)
 }
 
-async fn event_send(
-    event: Event, relays: Vec<String>
+async fn events_send(
+    events: Vec<Event>, relays_list: Vec<Vec<String>>
 ) -> Result<(), Error> {
-    let client = client_connected_relays_get(relays).await?;
-
-    for (key, value) in client.send_event(&event).await?.failed {
-        eprintln!("error: {key} sending event {value}");
+    if relays_list.len() != 1 && relays_list.len() != events.len() {
+        return Err(anyhow!(
+            "relays list should be len 1 or the same \
+             as the len of the events"
+        ));
     }
 
-    println!("event sent");
+    let client = client_connected_relays_get(&relays_list).await?;
+
+    for i in 0..events.len() {
+        let relays = if relays_list.len() == 1 {
+            &relays_list[0]
+        } else {
+            &relays_list[i]
+        };
+
+        for (key, value) in client.send_event_to(
+            relays, &events[i]
+        ).await?.failed {
+            eprintln!("error: {key} sending event {value}");
+        }
+
+        println!("event {i} sent");
+    }
 
     client.disconnect().await;
 
@@ -187,7 +216,8 @@ fn filter_add_options(
 
 async fn events_fetch(
     kinds: Vec<Kind>, public_key: &str, relays: Vec<String>,
-    since: Option<u64>, until: Option<u64>
+    since: Option<u64>, until: Option<u64>,
+    raw: bool
 ) -> Result<(), Error> {
     let mut filter: Filter = Filter::new()
         .authors([PublicKey::parse(public_key)?])
@@ -197,7 +227,11 @@ async fn events_fetch(
     let events = events_fetch_filter(filter, relays).await?;
 
     for event in events.to_vec() {
-        event_print(event)?;
+        if ! raw {
+            event_print(event)?;
+        } else {
+            println!("{}", event.as_pretty_json());
+        }
     }
 
     Ok(())
@@ -211,7 +245,7 @@ async fn events_fetch(
 // ["q", "<event-id> or <event-address>", "<relay-url>", "<pubkey-if-a-regular-event>"]
 //
 // TODO: support Kind::Custom(15)
-async fn dm_event(
+async fn dm_events(
     private_key: &str, receiver_public_key: &str, message: &str
 ) -> Result<(), Error> {
     let keys = Keys::parse(private_key)?;
@@ -221,11 +255,16 @@ async fn dm_event(
         .tags([Tag::public_key(receiver)])
         .build(keys.public_key());
 
-    let event: Event = EventBuilder::gift_wrap(
-        &keys, &receiver, rumor, []
+    let event_receiver: Event = EventBuilder::gift_wrap(
+        &keys, &receiver, rumor.clone(), []
     ).await?;
 
-    println!("{}", event.as_pretty_json());
+    let event_self: Event = EventBuilder::gift_wrap(
+        &keys, &keys.public_key(), rumor, []
+    ).await?;
+
+    println!("{}", event_receiver.as_pretty_json());
+    println!("{}", event_self.as_pretty_json());
 
     Ok(())
 }
@@ -233,25 +272,25 @@ async fn dm_event(
 // should be renamed gift_wraps_fetch then maybe an other function specific for
 // nip-17 private direct messages
 async fn dm_fetch(
-    private_key: &str, relays: Vec<String>,
-    since: Option<u64>, until: Option<u64>
+    private_key: &str, relays: Vec<String>
 ) -> Result<(), Error> {
     let keys = Keys::parse(private_key)?;
 
-    let mut filter: Filter = Filter::new()
+    let filter: Filter = Filter::new()
         .kind(Kind::GiftWrap)
         .pubkey(keys.public_key());
-    filter = filter_add_options(filter, since, until);
 
     let events = events_fetch_filter(filter, relays).await?;
 
     for event in events.to_vec() {
         if event.kind == Kind::GiftWrap {
+            // verification that pubkey of the kind::13 is the same on the
+            // kind::14/kind::15 is done in from_gift_wrap
             let UnwrappedGift { sender, rumor } =
                 UnwrappedGift::from_gift_wrap(&keys, &event).await?;
 
             let mut extra_fields =
-                indexmap::IndexMap::<String, serde_json::Value>::new();
+                JsonOrdered::new();
             extra_fields.insert(
                 format!("sender"),
                 serde_json::json!({
@@ -262,6 +301,89 @@ async fn dm_fetch(
 
             // TODO: handle Kind::Custom(15) better
             unsigned_event_print(rumor, Some(extra_fields))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn dm_save(
+    messages: Vec<JsonOrdered>, public_key: &str, dir_save: &str
+) -> Result<(), Error> {
+    let self_public_key = PublicKey::parse(public_key)?;
+
+    if ! utils::path_exists(dir_save) {
+        utils::mkdir(dir_save)?;
+    }
+
+    for message in messages {
+        let sender_bech32 = message.get("sender")
+            .ok_or(anyhow!("sender not present"))?
+            .as_object()
+            .ok_or(anyhow!("sender not obj"))?
+            .get("bech32")
+            .ok_or(anyhow!("bech32 not present"))?
+            .as_str()
+            .ok_or(anyhow!("bech32 not str"))?;
+        let peer_bech32 = if sender_bech32 != self_public_key.to_bech32()? {
+            sender_bech32
+        } else {
+            // TODO: handle multiple p tags
+
+            let mut tag_public_key: Option<&str> = None;
+
+            for tag in message.get("tags")
+                .ok_or(anyhow!("tags not present"))?
+                .as_array()
+                .ok_or(anyhow!("tags not array"))? {
+                let tag_array = tag
+                    .as_array()
+                    .ok_or(anyhow!("tag not array"))?;
+                if tag_array[0].as_str()
+                    .ok_or(anyhow!("tag element 0 not str"))?
+                == "p" && tag_array.len() >= 2 {
+                    tag_public_key = Some(tag_array[1]
+                        .as_str()
+                        .ok_or(anyhow!("tag element 1 not str"))?
+                    );
+                    break;
+                }
+            }
+
+            match tag_public_key {
+                Some(public_key) => {
+                    &PublicKey::parse(public_key)?.to_bech32()?
+                },
+                None => return Err(anyhow!("p tag not found"))
+            }
+        };
+
+        let peer_dir = format!("{dir_save}/{peer_bech32}");
+        if ! utils::path_exists(&peer_dir) {
+            utils::mkdir(&peer_dir)?;
+        }
+
+        let message_id = message.get("id")
+            .ok_or(anyhow!("id not present"))?
+            .as_str()
+            .ok_or(anyhow!("id not str"))?;
+
+        let created_at = message.get("created_at")
+            .ok_or(anyhow!("created_at not present"))?
+            .as_object()
+            .ok_or(anyhow!("created_at not object"))?
+            .get("timestamp")
+            .ok_or(anyhow!("timestamp not present"))?
+            .as_number()
+            .ok_or(anyhow!("timestamp not number"))?
+            .as_u64()
+            .ok_or(anyhow!("timestamp not u64"))?;
+
+        let message_file = format!("{peer_dir}/{created_at}-{message_id}");
+        if ! utils::path_exists(&message_file) {
+            utils::file_write(
+                &message_file, &(utils::json_to_string_pretty(&message) + "\n")
+            )?;
         }
     }
 
@@ -307,33 +429,48 @@ async fn handle_arguments() -> Result<(), Error> {
 r#"nmini action
 
 actions:
-<event> | event-send <relays>
+<events> | events-send <relays>...
 <private-key> | metadata-event <metadata-json>
 <private-key> | relay-list-event [standard|inbox] <relays>
-events-fetch <public-key> <relay-types> <relays> <filter-options>
-<private-key> | dm-event <public-key> <message>
-<private-key> | dm-fetch <relays> <filter-options>
+events-fetch [--raw] <public-key> <relay-types> <relays> <filter-options>
+<private-key> | dm-events <public-key> <message>
+<private-key> | dm-fetch <relays>
+<messages> | dm-save <public-key> <dir>
 
 args:
 private-key and public-key can be hex or bech32
-event is a signed json nostr event
+events is a list of signed json nostr event
 relays is a json array of string urls
 metadata-json is a json object that is parsed as metadata (nip-01, nip-24)
 relay-types is a json array of kinds (uint)
 filter-options is a json object that can have fields since and until
+messages is a list of json object messages
 "#
                 );
             },
-            "event-send" => {
-                current_parameter += 1;
-                let relays = arg_relay_array(current_parameter)?;
+            "events-send" => {
+                let mut relays_list: Vec<Vec<String>> = Vec::new();
+                while std::env::args().len() - current_parameter > 1 {
+                    current_parameter += 1;
+                    relays_list.push(arg_relay_array(current_parameter)?);
+                }
 
-                let event = Event::from_json(
-                    utils::read_stdin_pipe()
-                        .with_context(|| "reading private key in stdin")?
-                ).with_context(|| "parsing event")?;
+//                let event = Event::from_json(
+//                    utils::read_stdin_pipe()
+//                        .with_context(|| "reading event in stdin")?
+//                ).with_context(|| "parsing event")?;
 
-                event_send(event, relays).await?;
+                let mut events: Vec<Event> = Vec::new();
+                for event in serde_json::Deserializer::from_str(
+                    &utils::read_stdin_pipe()
+                        .with_context(|| "reading events in stdin")?
+                ).into_iter() {
+                    events.push(event
+                        .with_context(|| "deserializing event")?
+                    );
+                }
+
+                events_send(events, relays_list).await?;
             },
             "metadata-event" => {
                 current_parameter += 1;
@@ -372,6 +509,15 @@ filter-options is a json object that can have fields since and until
             },
             "events-fetch" => {
                 current_parameter += 1;
+                let raw = match std::env::args().nth(current_parameter)
+                    .ok_or(anyhow!("insert an arg"))?
+                    .as_ref() {
+                    "--raw" => {
+                        current_parameter += 1;
+                        true
+                    },
+                    _ => false
+                };
                 let public_key = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert public key"))?;
 
@@ -387,9 +533,11 @@ filter-options is a json object that can have fields since and until
                 current_parameter += 1;
                 let (since, until) = arg_filter_options(current_parameter)?;
 
-                events_fetch(relay_types, &public_key, relays, since, until).await?;
+                events_fetch(
+                    relay_types, &public_key, relays, since, until, raw
+                ).await?;
             },
-            "dm-event" => {
+            "dm-events" => {
                 current_parameter += 1;
                 let receiver_public_key = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert receiver public key"))?;
@@ -403,21 +551,43 @@ filter-options is a json object that can have fields since and until
                     .trim()
                     .to_owned();
 
-                dm_event(&private_key, &receiver_public_key, &message).await?;
+                dm_events(&private_key, &receiver_public_key, &message).await?;
             },
             "dm-fetch" => {
                 current_parameter += 1;
                 let relays = arg_relay_array(current_parameter)?;
 
-                current_parameter += 1;
-                let (since, until) = arg_filter_options(current_parameter)?;
+                // no since gift wrapped events have randomized created_at
+                // current_parameter += 1;
+                // let (since, until) = arg_filter_options(current_parameter)?;
 
                 let private_key = utils::read_stdin_pipe()
                     .with_context(|| "reading private key in stdin")?
                     .trim()
                     .to_owned();
 
-                dm_fetch(&private_key, relays, since, until).await?;
+                dm_fetch(&private_key, relays).await?;
+            },
+            "dm-save" => {
+                current_parameter += 1;
+                let public_key = std::env::args().nth(current_parameter)
+                    .ok_or(anyhow!("insert public key"))?;
+
+                current_parameter += 1;
+                let dir_save = std::env::args().nth(current_parameter)
+                    .ok_or(anyhow!("insert dir"))?;
+
+                let mut messages: Vec<JsonOrdered> = Vec::new();
+                for message in serde_json::Deserializer::from_str(
+                    &utils::read_stdin_pipe()
+                        .with_context(|| "reading messages in stdin")?
+                ).into_iter() {
+                    messages.push(message
+                        .with_context(|| "deserializing message")?
+                    );
+                }
+
+                dm_save(messages, &public_key, &dir_save)?;
             },
             _ => return Err(anyhow!("argument {arg} not recognized"))
         },
