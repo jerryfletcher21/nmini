@@ -26,18 +26,11 @@ fn timeout_get() -> Duration {
     Duration::from_secs(60)
 }
 
-fn tor_socket_get() -> SocketAddr {
-    // let tor_host = "127.0.0.1";
-    // let tor_port = 9050;
-    SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9050
-    )
-}
-
 fn unsigned_event_print(
-    event: UnsignedEvent, extra_fields: Option<indexmap::IndexMap<String, Value>>
+    event: UnsignedEvent,
+    extra_fields: Option<indexmap::IndexMap<String, serde_json::Value>>
 ) -> Result<(), Error> {
-    let mut event_json = indexmap::IndexMap::<String, Value>::new();
+    let mut event_json = indexmap::IndexMap::<String, serde_json::Value>::new();
 
     event_json.insert(
         format!("kind"),
@@ -92,10 +85,14 @@ async fn client_connected_relays_get(
 ) -> Result<Client, Error> {
     let timeout = timeout_get();
 
+    let tor_socket: SocketAddr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9050
+    );
+
     let client = Client::builder()
         .opts(ClientOptions::new()
             .gossip(false)
-            .connection(Connection::new().proxy(tor_socket_get()))
+            .connection(Connection::new().proxy(tor_socket))
         ).build();
 
     for relay in relays {
@@ -108,7 +105,7 @@ async fn client_connected_relays_get(
     Ok(client)
 }
 
-async fn events_fetch(
+async fn events_fetch_filter(
     filter: Filter, relays: Vec<String>
 ) -> Result<Events, Error> {
     let timeout = timeout_get();
@@ -151,24 +148,6 @@ fn metadata_event(
     Ok(())
 }
 
-async fn metadata_fetch(
-    public_key: &str, relays: Vec<String>
-) -> Result<(), Error> {
-    let metadata_kind = Kind::Metadata;
-
-    let filter: Filter = Filter::new()
-        .authors([PublicKey::parse(public_key)?])
-        .kinds([metadata_kind]);
-
-    let events = events_fetch(filter, relays).await?;
-
-    for event in events.to_vec() {
-        event_print(event)?;
-    }
-
-    Ok(())
-}
-
 // currently specifying just read/write for nip-65 not supported
 fn relay_list_event(
     kind: Kind, private_key: &str, relays: Vec<String>
@@ -193,14 +172,14 @@ fn relay_list_event(
     Ok(())
 }
 
-async fn relay_list_fetch(
+async fn events_fetch(
     kinds: Vec<Kind>, public_key: &str, relays: Vec<String>
 ) -> Result<(), Error> {
     let filter: Filter = Filter::new()
         .authors([PublicKey::parse(public_key)?])
         .kinds(kinds);
 
-    let events = events_fetch(filter, relays).await?;
+    let events = events_fetch_filter(filter, relays).await?;
 
     for event in events.to_vec() {
         event_print(event)?;
@@ -247,17 +226,21 @@ async fn dm_fetch(
         .kind(Kind::GiftWrap)
         .pubkey(keys.public_key());
 
-    let events = events_fetch(filter, relays).await?;
+    let events = events_fetch_filter(filter, relays).await?;
 
     for event in events.to_vec() {
         if event.kind == Kind::GiftWrap {
             let UnwrappedGift { sender, rumor } =
                 UnwrappedGift::from_gift_wrap(&keys, &event).await?;
 
-            let mut extra_fields = indexmap::IndexMap::<String, Value>::new();
+            let mut extra_fields =
+                indexmap::IndexMap::<String, serde_json::Value>::new();
             extra_fields.insert(
                 format!("sender"),
-                serde_json::json!(sender.to_hex())
+                serde_json::json!({
+                    "bech32": sender.to_bech32()?,
+                    "hex": sender.to_hex()
+                })
             );
 
             // TODO: handle Kind::Custom(15) better
@@ -288,18 +271,17 @@ r#"nmini action
 actions:
 <event> | event-send <relays>
 <private-key> | metadata-event <metadata-json>
-metadata-fetch <public-key> <relays>
 <private-key> | relay-list-event [standard|inbox] <relays>
-relay-list-fetch [all|standard|inbox] <public-key> <relays>
+events-fetch <public-key> <relay-types> <relays>
 <private-key> | dm-event <public-key> <message>
 <private-key> | dm-fetch <relays>
 
 args:
-metadata-json and relays are parsed as json
-metadata-json is an object that is parsed as metadata (nip-01, nip-24)
-relays is an array of string urls
 private-key and public-key can be hex or bech32
 event is a signed json nostr event
+relays is a json array of string urls
+metadata-json is a json object that is parsed as metadata (nip-01, nip-24)
+relay-types is a json array of kinds (uint)
 "#
                 );
             },
@@ -328,16 +310,6 @@ event is a signed json nostr event
 
                 metadata_event(metadata, &private_key)?;
             },
-            "metadata-fetch" => {
-                current_parameter += 1;
-                let public_key = std::env::args().nth(current_parameter)
-                    .ok_or(anyhow!("insert public key"))?;
-
-                current_parameter += 1;
-                let relays = arg_relay_array(current_parameter)?;
-
-                metadata_fetch(&public_key, relays).await?;
-            },
             "relay-list-event" => {
                 current_parameter += 1;
                 let relay_type = match std::env::args().nth(current_parameter)
@@ -359,26 +331,21 @@ event is a signed json nostr event
 
                 relay_list_event(relay_type, &private_key, relays)?;
             },
-            "relay-list-fetch" => {
-                current_parameter += 1;
-                let relay_type = match std::env::args().nth(current_parameter)
-                    .ok_or(anyhow!("insert relay type"))?.as_str() {
-                    "all" => vec!(Kind::RelayList, Kind::InboxRelays),
-                    "standard" => vec!(Kind::RelayList),
-                    "inbox" => vec!(Kind::InboxRelays),
-                    relay_type_arg => return Err(anyhow!(
-                        "{relay_type_arg} is not a relay type for {arg}"
-                    ))
-                };
-
+            "events-fetch" => {
                 current_parameter += 1;
                 let public_key = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert public key"))?;
 
                 current_parameter += 1;
+                let relay_types: Vec<Kind> = serde_json::from_str(
+                    &std::env::args().nth(current_parameter)
+                        .ok_or(anyhow!("insert relay types"))?
+                ).with_context(|| "parsing relay types")?;
+
+                current_parameter += 1;
                 let relays = arg_relay_array(current_parameter)?;
 
-                relay_list_fetch(relay_type, &public_key, relays).await?;
+                events_fetch(relay_types, &public_key, relays).await?;
             },
             "dm-event" => {
                 current_parameter += 1;
