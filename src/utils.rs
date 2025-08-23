@@ -32,3 +32,15 @@ pub fn unix_timestamp_s_to_string(timestamp: u64) -> Result<String, Error> {
 
     Ok(datetime.format("%Y/%m/%d %H:%M").to_string())
 }
+
+pub fn u64_from_serde_value(
+    object: &serde_json::Value, key: &str
+) -> Result<u64, Error> {
+    Ok(object.get(key)
+        .ok_or(anyhow!("{key} not present"))?
+        .as_number()
+        .ok_or(anyhow!("{key} not number"))?
+        .as_u64()
+        .ok_or(anyhow!("{key} not u64"))?
+    )
+}

@@ -172,12 +172,27 @@ fn relay_list_event(
     Ok(())
 }
 
+fn filter_add_options(
+    mut filter: Filter, since: Option<u64>, until: Option<u64>
+) -> Filter {
+    if let Some(since) = since {
+        filter = filter.since(Timestamp::from(since))
+    }
+    if let Some(until) = until {
+        filter = filter.until(Timestamp::from(until))
+    }
+
+    filter
+}
+
 async fn events_fetch(
-    kinds: Vec<Kind>, public_key: &str, relays: Vec<String>
+    kinds: Vec<Kind>, public_key: &str, relays: Vec<String>,
+    since: Option<u64>, until: Option<u64>
 ) -> Result<(), Error> {
-    let filter: Filter = Filter::new()
+    let mut filter: Filter = Filter::new()
         .authors([PublicKey::parse(public_key)?])
         .kinds(kinds);
+    filter = filter_add_options(filter, since, until);
 
     let events = events_fetch_filter(filter, relays).await?;
 
@@ -218,13 +233,15 @@ async fn dm_event(
 // should be renamed gift_wraps_fetch then maybe an other function specific for
 // nip-17 private direct messages
 async fn dm_fetch(
-    private_key: &str, relays: Vec<String>
+    private_key: &str, relays: Vec<String>,
+    since: Option<u64>, until: Option<u64>
 ) -> Result<(), Error> {
     let keys = Keys::parse(private_key)?;
 
-    let filter: Filter = Filter::new()
+    let mut filter: Filter = Filter::new()
         .kind(Kind::GiftWrap)
         .pubkey(keys.public_key());
+    filter = filter_add_options(filter, since, until);
 
     let events = events_fetch_filter(filter, relays).await?;
 
@@ -260,6 +277,27 @@ fn arg_relay_array(current_parameter: usize) -> Result<Vec<String>, Error> {
     Ok(relays)
 }
 
+fn arg_filter_options(
+    current_parameter: usize
+) -> Result<(Option<u64>, Option<u64>), Error> {
+    let mut since: Option<u64> = None;
+    let mut until: Option<u64> = None;
+
+    let options: serde_json::Value = serde_json::from_str(
+        &std::env::args().nth(current_parameter)
+            .ok_or(anyhow!("insert filter options"))?
+    ).with_context(|| "parsing filter options")?;
+
+    if let Ok(value) = utils::u64_from_serde_value(&options, "since") {
+        since = Some(value);
+    }
+    if let Ok(value) = utils::u64_from_serde_value(&options, "until") {
+        until = Some(value);
+    }
+
+    Ok((since, until))
+}
+
 async fn handle_arguments() -> Result<(), Error> {
     let mut current_parameter: usize = 1;
     match std::env::args().nth(current_parameter).as_deref() {
@@ -272,9 +310,9 @@ actions:
 <event> | event-send <relays>
 <private-key> | metadata-event <metadata-json>
 <private-key> | relay-list-event [standard|inbox] <relays>
-events-fetch <public-key> <relay-types> <relays>
+events-fetch <public-key> <relay-types> <relays> <filter-options>
 <private-key> | dm-event <public-key> <message>
-<private-key> | dm-fetch <relays>
+<private-key> | dm-fetch <relays> <filter-options>
 
 args:
 private-key and public-key can be hex or bech32
@@ -282,6 +320,7 @@ event is a signed json nostr event
 relays is a json array of string urls
 metadata-json is a json object that is parsed as metadata (nip-01, nip-24)
 relay-types is a json array of kinds (uint)
+filter-options is a json object that can have fields since and until
 "#
                 );
             },
@@ -345,7 +384,10 @@ relay-types is a json array of kinds (uint)
                 current_parameter += 1;
                 let relays = arg_relay_array(current_parameter)?;
 
-                events_fetch(relay_types, &public_key, relays).await?;
+                current_parameter += 1;
+                let (since, until) = arg_filter_options(current_parameter)?;
+
+                events_fetch(relay_types, &public_key, relays, since, until).await?;
             },
             "dm-event" => {
                 current_parameter += 1;
@@ -367,12 +409,15 @@ relay-types is a json array of kinds (uint)
                 current_parameter += 1;
                 let relays = arg_relay_array(current_parameter)?;
 
+                current_parameter += 1;
+                let (since, until) = arg_filter_options(current_parameter)?;
+
                 let private_key = utils::read_stdin_pipe()
                     .with_context(|| "reading private key in stdin")?
                     .trim()
                     .to_owned();
 
-                dm_fetch(&private_key, relays).await?;
+                dm_fetch(&private_key, relays, since, until).await?;
             },
             _ => return Err(anyhow!("argument {arg} not recognized"))
         },
