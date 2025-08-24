@@ -40,8 +40,11 @@ fn unsigned_event_print(
     );
 
     event_json.insert(
-        format!("kind"),
-        serde_json::json!(event.kind)
+        format!("pubkey"),
+        serde_json::json!({
+            "bech32": event.pubkey.to_bech32()?,
+            "hex": event.pubkey.to_hex()
+        })
     );
 
     event_json.insert(
@@ -55,9 +58,8 @@ fn unsigned_event_print(
     );
 
     event_json.insert(
-        format!("content"),
-        serde_json::from_str::<serde_json::Value>(&event.content)
-            .unwrap_or_else(|_| serde_json::json!(&event.content))
+        format!("kind"),
+        serde_json::json!(event.kind)
     );
 
     event_json.insert(
@@ -65,28 +67,19 @@ fn unsigned_event_print(
         serde_json::json!(event.tags.as_slice())
     );
 
+    event_json.insert(
+        format!("content"),
+        serde_json::from_str::<serde_json::Value>(&event.content)
+            .unwrap_or_else(|_| serde_json::json!(&event.content))
+    );
+
     if let Some(extra_fields) = extra_fields {
         event_json.extend(extra_fields);
     }
 
-//    let mut tags: Vec<Vec<String>> = Vec::new();
-//    for tag in event.tags.as_slice() {
-//        tags.push((&tag.as_slice()[1..]).to_vec());
-//    }
-//    event_json.insert(
-//        format!("relays"),
-//        serde_json::json!(tags)
-//    );
-
     println!("{}", utils::json_to_string_pretty(&event_json));
 
     Ok(())
-}
-
-fn event_print(
-    event: Event
-) -> Result<(), Error> {
-    unsigned_event_print(event.into(), None)
 }
 
 // create client with tor, connect it to the relays and return it
@@ -216,8 +209,7 @@ fn filter_add_options(
 
 async fn events_fetch(
     kinds: Vec<Kind>, public_key: &str, relays: Vec<String>,
-    since: Option<u64>, until: Option<u64>,
-    raw: bool
+    since: Option<u64>, until: Option<u64>
 ) -> Result<(), Error> {
     let mut filter: Filter = Filter::new()
         .authors([PublicKey::parse(public_key)?])
@@ -227,11 +219,20 @@ async fn events_fetch(
     let events = events_fetch_filter(filter, relays).await?;
 
     for event in events.to_vec() {
-        if ! raw {
-            event_print(event)?;
-        } else {
-            println!("{}", event.as_pretty_json());
-        }
+        println!("{}", event.as_pretty_json());
+    }
+
+    Ok(())
+}
+
+fn rumors_info<T>(
+    rumors: Vec<T>
+) -> Result<(), Error>
+where
+    T: Into<UnsignedEvent>
+{
+    for rumor in rumors {
+        unsigned_event_print(rumor.into(), None)?;
     }
 
     Ok(())
@@ -284,20 +285,28 @@ async fn dm_fetch(
 
     for event in events.to_vec() {
         if event.kind == Kind::GiftWrap {
-            // verification that pubkey of the kind::13 is the same on the
-            // kind::14/kind::15 is done in from_gift_wrap
             let UnwrappedGift { sender, rumor } =
                 UnwrappedGift::from_gift_wrap(&keys, &event).await?;
 
             let mut extra_fields =
                 JsonOrdered::new();
-            extra_fields.insert(
-                format!("sender"),
-                serde_json::json!({
-                    "bech32": sender.to_bech32()?,
-                    "hex": sender.to_hex()
-                })
-            );
+
+            if sender != rumor.pubkey {
+                extra_fields.insert(
+                    format!("warning"),
+                    serde_json::json!(format!(
+                        "pubkey of the sealed event is not the same as the \
+                         one in the rumor"
+                    ))
+                );
+                extra_fields.insert(
+                    format!("sealed"),
+                    serde_json::json!({
+                        "bech32": sender.to_bech32()?,
+                        "hex": sender.to_hex()
+                    })
+                );
+            }
 
             // TODO: handle Kind::Custom(15) better
             unsigned_event_print(rumor, Some(extra_fields))?;
@@ -390,6 +399,32 @@ fn dm_save(
     Ok(())
 }
 
+fn stdin_events_array<T>() -> Result<Vec<T>, Error>
+where
+    T: Into<UnsignedEvent> + for<'a>serde::Deserialize<'a>
+{
+    let mut events: Vec<T> = Vec::new();
+
+    for event in serde_json::Deserializer::from_str(
+        &utils::read_stdin_pipe()
+            .with_context(|| "reading events in stdin")?
+    ).into_iter() {
+        events.push(event
+            .with_context(|| "deserializing event")?
+        );
+    }
+
+    Ok(events)
+}
+
+fn stdin_private_key() -> Result<String, Error> {
+    Ok(utils::read_stdin_pipe()
+        .with_context(|| "reading private key in stdin")?
+        .trim()
+        .to_owned()
+    )
+}
+
 fn arg_relay_array(current_parameter: usize) -> Result<Vec<String>, Error> {
     let relays: Vec<String> = serde_json::from_str(
         &std::env::args().nth(current_parameter)
@@ -432,14 +467,16 @@ actions:
 <events> | events-send <relays>...
 <private-key> | metadata-event <metadata-json>
 <private-key> | relay-list-event [standard|inbox] <relays>
-events-fetch [--raw] <public-key> <relay-types> <relays> <filter-options>
+events-fetch <public-key> <relay-types> <relays> <filter-options>
+<rumors> | rumors-info
 <private-key> | dm-events <public-key> <message>
 <private-key> | dm-fetch <relays>
 <messages> | dm-save <public-key> <dir>
 
 args:
 private-key and public-key can be hex or bech32
-events is a list of signed json nostr event
+events is a list of signed json nostr events
+rumors is a list of signed or unsiged json nostr events
 relays is a json array of string urls
 metadata-json is a json object that is parsed as metadata (nip-01, nip-24)
 relay-types is a json array of kinds (uint)
@@ -455,20 +492,7 @@ messages is a list of json object messages
                     relays_list.push(arg_relay_array(current_parameter)?);
                 }
 
-//                let event = Event::from_json(
-//                    utils::read_stdin_pipe()
-//                        .with_context(|| "reading event in stdin")?
-//                ).with_context(|| "parsing event")?;
-
-                let mut events: Vec<Event> = Vec::new();
-                for event in serde_json::Deserializer::from_str(
-                    &utils::read_stdin_pipe()
-                        .with_context(|| "reading events in stdin")?
-                ).into_iter() {
-                    events.push(event
-                        .with_context(|| "deserializing event")?
-                    );
-                }
+                let events: Vec<Event> = stdin_events_array()?;
 
                 events_send(events, relays_list).await?;
             },
@@ -479,10 +503,7 @@ messages is a list of json object messages
                         .ok_or(anyhow!("insert metadata json"))?
                 ).with_context(|| "parsing metadata json")?;
 
-                let private_key = utils::read_stdin_pipe()
-                    .with_context(|| "reading private key in stdin")?
-                    .trim()
-                    .to_owned();
+                let private_key = stdin_private_key()?;
 
                 metadata_event(metadata, &private_key)?;
             },
@@ -500,24 +521,12 @@ messages is a list of json object messages
                 current_parameter += 1;
                 let relays = arg_relay_array(current_parameter)?;
 
-                let private_key = utils::read_stdin_pipe()
-                    .with_context(|| "reading private key in stdin")?
-                    .trim()
-                    .to_owned();
+                let private_key = stdin_private_key()?;
 
                 relay_list_event(relay_type, &private_key, relays)?;
             },
             "events-fetch" => {
                 current_parameter += 1;
-                let raw = match std::env::args().nth(current_parameter)
-                    .ok_or(anyhow!("insert an arg"))?
-                    .as_ref() {
-                    "--raw" => {
-                        current_parameter += 1;
-                        true
-                    },
-                    _ => false
-                };
                 let public_key = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert public key"))?;
 
@@ -534,9 +543,14 @@ messages is a list of json object messages
                 let (since, until) = arg_filter_options(current_parameter)?;
 
                 events_fetch(
-                    relay_types, &public_key, relays, since, until, raw
+                    relay_types, &public_key, relays, since, until
                 ).await?;
             },
+            "rumors-info" => {
+                let rumors: Vec<UnsignedEvent> = stdin_events_array()?;
+
+                rumors_info(rumors)?;
+            }
             "dm-events" => {
                 current_parameter += 1;
                 let receiver_public_key = std::env::args().nth(current_parameter)
@@ -546,10 +560,7 @@ messages is a list of json object messages
                 let message = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert message"))?;
 
-                let private_key = utils::read_stdin_pipe()
-                    .with_context(|| "reading private key in stdin")?
-                    .trim()
-                    .to_owned();
+                let private_key = stdin_private_key()?;
 
                 dm_events(&private_key, &receiver_public_key, &message).await?;
             },
@@ -561,10 +572,7 @@ messages is a list of json object messages
                 // current_parameter += 1;
                 // let (since, until) = arg_filter_options(current_parameter)?;
 
-                let private_key = utils::read_stdin_pipe()
-                    .with_context(|| "reading private key in stdin")?
-                    .trim()
-                    .to_owned();
+                let private_key = stdin_private_key()?;
 
                 dm_fetch(&private_key, relays).await?;
             },
