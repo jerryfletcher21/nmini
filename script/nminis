@@ -23,8 +23,18 @@ dm_fetch_save() {
     private_key="$(cat)"
     public_key="$(printf "%s\n" "$private_key" | nmini key-convert phex)"
 
-    printf "%s\n" "$private_key" |
-    nmini dm-fetch "$inbox_relays" |
+    fetched_messages="$(
+        printf "%s\n" "$private_key" |
+        nmini dm-fetch "$inbox_relays"
+    )"
+    if warnings="$(
+        printf "%s\n" "$fetched_messages" |
+        jq -e '.warning' 2>/dev/null
+    )"; then
+        printf "%s\n" "$warnings" >&2
+    fi
+
+    printf "%s\n" "$fetched_messages" |
     nmini dm-save "$public_key" "$save_dir"
 }
 

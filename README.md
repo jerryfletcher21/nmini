@@ -3,6 +3,10 @@
 Really simple nostr cli tool for sending
 [NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) dms.
 
+Right now there is just partial support for kind:15 encrypted file messages.
+
+[nminis](script/nminis) is an example script using nmini.
+
 Using [rust-nostr](https://github.com/rust-nostr/nostr).
 
 ```
