@@ -1,0 +1,90 @@
+#!/bin/sh
+
+alias fzf="fzy"
+
+dm_fetch_save() {
+    if [ "$#" -lt 1 ]; then
+        echo "error: insert inbox relays" >&2
+        return 1
+    fi
+    inbox_relays="$1"
+    shift 1
+    if [ "$#" -lt 1 ]; then
+        echo "error: insert save dir" >&2
+        return 1
+    fi
+    save_dir="$1"
+    shift 1
+
+    if [ -t 0 ]; then
+        echo "error: insert private key in stdin" >&2
+        return 1
+    fi
+    private_key="$(cat)"
+    public_key="$(printf "%s\n" "$private_key" | nmini key-convert phex)"
+
+    printf "%s\n" "$private_key" |
+    nmini dm-fetch "$inbox_relays" |
+    nmini dm-save "$public_key" "$save_dir"
+}
+
+chat_show() {
+    if [ "$#" -lt 1 ]; then
+        echo "error: insert peer dir" >&2
+        return 1
+    fi
+    peer_dir="$1"
+    shift 1
+
+    find "$peer_dir" -mindepth 1 -maxdepth 1 -type f |
+    sort -n |
+    xargs -I '{}' cat '{}' |
+    jq -r '. | "[\(.created_at.date)] \(.pubkey.bech32[4:8]) | \(.content)"'
+}
+
+chat_find_show() {
+    if [ "$#" -lt 1 ]; then
+        echo "error: insert base dir" >&2
+        return 1
+    fi
+    base_dir="$1"
+    shift 1
+
+    peer="$(
+        find "$base_dir" -mindepth 1 -maxdepth 1 -type d -exec basename '{}' \; |
+        fzf
+    )"
+
+    chat_show "$base_dir/$peer"
+}
+
+info=$(cat << EOF
+nminis action [options]
+
+<private-key> | dm-fetch-save <inbox-relays> <dir>
+chat-show <peer-dir>
+chat-find-show <dir>
+EOF
+)
+
+if [ "$#" -lt 1 ]; then
+    echo "error: insert arguments" >&2
+    exit 1
+fi
+action="$1"
+shift 1
+case "$action" in
+    -h|--help)
+        echo "$info"
+        exit 0
+    ;;
+    dm-fetch-save)
+        dm_fetch_save "$@"
+    ;;
+    chat-show)
+        chat_show "$@"
+    ;;
+    chat-find-show)
+        chat_find_show "$@"
+    ;;
+esac

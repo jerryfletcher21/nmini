@@ -1,9 +1,10 @@
-mod utils;
-
+use std::io::{IsTerminal, Read};
+use std::str::FromStr;
 use std::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::{anyhow, Context, Error};
+use chrono::{DateTime, Local};
 
 use nostr_sdk::prelude::*;
 
@@ -24,8 +25,118 @@ use nostr_sdk::prelude::*;
 
 type JsonOrdered = indexmap::IndexMap<String, serde_json::Value>;
 
+enum KeyTypeFormat {
+    SecretHex,
+    SecretBech32,
+    PublicHex,
+    PublicBech32
+}
+
+impl FromStr for KeyTypeFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "shex" => Self::SecretHex,
+            "sbech32" => Self::SecretBech32,
+            "phex" => Self::PublicHex,
+            "pbech32" => Self::PublicBech32,
+            _ => return Err(anyhow!("can not parse {s}"))
+        })
+    }
+}
+
+// utils
+
+fn path_exists(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
+fn mkdir(path: &str) -> Result<(), Error> {
+    std::fs::create_dir_all(std::path::PathBuf::from(&path))?;
+
+    Ok(())
+}
+
+fn file_write(file_name: &str, content: &str) -> Result<(), Error> {
+    Ok(std::fs::write(file_name, content)?)
+}
+
+fn json_to_string_pretty<T: ?Sized>(json_value: &T) -> String
+where
+    T: serde::ser::Serialize
+{
+    serde_json::to_string_pretty(&json_value)
+        .unwrap_or_else(|_| format!("error: getting json string pretty"))
+}
+
+fn read_stdin_pipe() -> Result<String, Error> {
+    let mut input = std::io::stdin();
+
+    if input.is_terminal() {
+        return Err(anyhow!("stdin is empty"));
+    }
+
+    let mut output = String::new();
+
+    input.read_to_string(&mut output)?;
+
+    Ok(output)
+}
+
+fn datetime_human_readable_format_get() -> &'static str {
+    "%Y/%m/%d %H:%M:%S"
+}
+
+fn unix_timestamp_s_to_string(timestamp: u64) -> Result<String, Error> {
+    let datetime =
+        DateTime::from_timestamp(timestamp as i64, 0)
+            .ok_or(anyhow!("datetime from timestamp seconds"))?
+            .with_timezone(&Local);
+
+    Ok(datetime.format(datetime_human_readable_format_get()).to_string())
+}
+
+fn u64_from_serde_value(
+    object: &serde_json::Value, key: &str
+) -> Result<u64, Error> {
+    Ok(object.get(key)
+        .ok_or(anyhow!("{key} not present"))?
+        .as_number()
+        .ok_or(anyhow!("{key} not number"))?
+        .as_u64()
+        .ok_or(anyhow!("{key} not u64"))?
+    )
+}
+
 fn timeout_get() -> Duration {
     Duration::from_secs(60)
+}
+
+// actions
+
+fn key_convert(key: &str, key_type_format: KeyTypeFormat) -> Result<(), Error> {
+    let key_output = if let Ok(keys) = Keys::parse(key) {
+        match key_type_format {
+            KeyTypeFormat::SecretHex => keys.secret_key().to_secret_hex(),
+            KeyTypeFormat::SecretBech32 => keys.secret_key().to_bech32()?,
+            KeyTypeFormat::PublicHex => keys.public_key().to_hex(),
+            KeyTypeFormat::PublicBech32 => keys.public_key().to_bech32()?
+        }
+    } else if let Ok(public_key) = PublicKey::parse(key) {
+        match key_type_format {
+            KeyTypeFormat::SecretHex|KeyTypeFormat::SecretBech32 =>
+                return Err(anyhow!("can not get private key from public key")),
+            KeyTypeFormat::PublicHex => public_key.to_hex(),
+            KeyTypeFormat::PublicBech32 => public_key.to_bech32()?
+        }
+    } else {
+        return Err(anyhow!("stdin is not a secret key nor a public key"));
+    };
+
+    println!("{key_output}");
+
+    Ok(())
 }
 
 fn unsigned_event_print(
@@ -52,7 +163,7 @@ fn unsigned_event_print(
         serde_json::json!({
             "timestamp": event.created_at.as_u64(),
             "date": serde_json::json!(
-                utils::unix_timestamp_s_to_string(event.created_at.as_u64())?
+                unix_timestamp_s_to_string(event.created_at.as_u64())?
             )
         })
     );
@@ -77,7 +188,7 @@ fn unsigned_event_print(
         event_json.extend(extra_fields);
     }
 
-    println!("{}", utils::json_to_string_pretty(&event_json));
+    println!("{}", json_to_string_pretty(&event_json));
 
     Ok(())
 }
@@ -151,7 +262,7 @@ async fn events_send(
             eprintln!("error: {key} sending event {value}");
         }
 
-        println!("event {i} sent");
+        println!("event {} sent", i + 1);
     }
 
     client.disconnect().await;
@@ -321,12 +432,12 @@ fn dm_save(
 ) -> Result<(), Error> {
     let self_public_key = PublicKey::parse(public_key)?;
 
-    if ! utils::path_exists(dir_save) {
-        utils::mkdir(dir_save)?;
+    if ! path_exists(dir_save) {
+        mkdir(dir_save)?;
     }
 
     for message in messages {
-        let sender_bech32 = message.get("sender")
+        let sender_bech32 = message.get("pubkey")
             .ok_or(anyhow!("sender not present"))?
             .as_object()
             .ok_or(anyhow!("sender not obj"))?
@@ -368,8 +479,8 @@ fn dm_save(
         };
 
         let peer_dir = format!("{dir_save}/{peer_bech32}");
-        if ! utils::path_exists(&peer_dir) {
-            utils::mkdir(&peer_dir)?;
+        if ! path_exists(&peer_dir) {
+            mkdir(&peer_dir)?;
         }
 
         let message_id = message.get("id")
@@ -389,9 +500,9 @@ fn dm_save(
             .ok_or(anyhow!("timestamp not u64"))?;
 
         let message_file = format!("{peer_dir}/{created_at}-{message_id}");
-        if ! utils::path_exists(&message_file) {
-            utils::file_write(
-                &message_file, &(utils::json_to_string_pretty(&message) + "\n")
+        if ! path_exists(&message_file) {
+            file_write(
+                &message_file, &(json_to_string_pretty(&message) + "\n")
             )?;
         }
     }
@@ -406,7 +517,7 @@ where
     let mut events: Vec<T> = Vec::new();
 
     for event in serde_json::Deserializer::from_str(
-        &utils::read_stdin_pipe()
+        &read_stdin_pipe()
             .with_context(|| "reading events in stdin")?
     ).into_iter() {
         events.push(event
@@ -417,9 +528,9 @@ where
     Ok(events)
 }
 
-fn stdin_private_key() -> Result<String, Error> {
-    Ok(utils::read_stdin_pipe()
-        .with_context(|| "reading private key in stdin")?
+fn stdin_key() -> Result<String, Error> {
+    Ok(read_stdin_pipe()
+        .with_context(|| "reading key in stdin")?
         .trim()
         .to_owned()
     )
@@ -445,10 +556,10 @@ fn arg_filter_options(
             .ok_or(anyhow!("insert filter options"))?
     ).with_context(|| "parsing filter options")?;
 
-    if let Ok(value) = utils::u64_from_serde_value(&options, "since") {
+    if let Ok(value) = u64_from_serde_value(&options, "since") {
         since = Some(value);
     }
-    if let Ok(value) = utils::u64_from_serde_value(&options, "until") {
+    if let Ok(value) = u64_from_serde_value(&options, "until") {
         until = Some(value);
     }
 
@@ -464,6 +575,7 @@ async fn handle_arguments() -> Result<(), Error> {
 r#"nmini action
 
 actions:
+<key> | key-convert shex|sbech32|phex|pbech32
 <events> | events-send <relays>...
 <private-key> | metadata-event <metadata-json>
 <private-key> | relay-list-event [standard|inbox] <relays>
@@ -475,6 +587,7 @@ events-fetch <public-key> <relay-types> <relays> <filter-options>
 
 args:
 private-key and public-key can be hex or bech32
+key can be private-key or public-key
 events is a list of signed json nostr events
 rumors is a list of signed or unsiged json nostr events
 relays is a json array of string urls
@@ -484,6 +597,17 @@ filter-options is a json object that can have fields since and until
 messages is a list of json object messages
 "#
                 );
+            },
+            "key-convert" => {
+                current_parameter += 1;
+                let key_type_format = KeyTypeFormat::from_str(
+                    &std::env::args().nth(current_parameter)
+                        .ok_or(anyhow!("insert key type format"))?
+                ).with_context(|| "parsing key type format")?;
+
+                let key = stdin_key()?;
+
+                key_convert(&key, key_type_format)?;
             },
             "events-send" => {
                 let mut relays_list: Vec<Vec<String>> = Vec::new();
@@ -503,7 +627,7 @@ messages is a list of json object messages
                         .ok_or(anyhow!("insert metadata json"))?
                 ).with_context(|| "parsing metadata json")?;
 
-                let private_key = stdin_private_key()?;
+                let private_key = stdin_key()?;
 
                 metadata_event(metadata, &private_key)?;
             },
@@ -521,7 +645,7 @@ messages is a list of json object messages
                 current_parameter += 1;
                 let relays = arg_relay_array(current_parameter)?;
 
-                let private_key = stdin_private_key()?;
+                let private_key = stdin_key()?;
 
                 relay_list_event(relay_type, &private_key, relays)?;
             },
@@ -560,7 +684,7 @@ messages is a list of json object messages
                 let message = std::env::args().nth(current_parameter)
                     .ok_or(anyhow!("insert message"))?;
 
-                let private_key = stdin_private_key()?;
+                let private_key = stdin_key()?;
 
                 dm_events(&private_key, &receiver_public_key, &message).await?;
             },
@@ -572,7 +696,7 @@ messages is a list of json object messages
                 // current_parameter += 1;
                 // let (since, until) = arg_filter_options(current_parameter)?;
 
-                let private_key = stdin_private_key()?;
+                let private_key = stdin_key()?;
 
                 dm_fetch(&private_key, relays).await?;
             },
@@ -587,7 +711,7 @@ messages is a list of json object messages
 
                 let mut messages: Vec<JsonOrdered> = Vec::new();
                 for message in serde_json::Deserializer::from_str(
-                    &utils::read_stdin_pipe()
+                    &read_stdin_pipe()
                         .with_context(|| "reading messages in stdin")?
                 ).into_iter() {
                     messages.push(message

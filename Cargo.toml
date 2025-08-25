@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libc = "0.2.175"
 anyhow = "1.0.99"
 chrono = "0.4.41"
-indexmap = { version = "2.10.0", features = ["serde"] }
-libc = "0.2.175"
-nostr-sdk = { version = "0.43.0", features = ["tor", "all-nips"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
+indexmap = { version = "2.10.0", features = ["serde"] }
 tokio = { version = "1.47.1", features = ["full"] }
+nostr-sdk = { version = "0.43.0", features = ["tor", "all-nips"] }
