@@ -579,7 +579,7 @@ actions:
 <events> | events-send <relays>...
 <private-key> | metadata-event <metadata-json>
 <private-key> | relay-list-event [standard|inbox] <relays>
-events-fetch <public-key> <relay-types> <relays> <filter-options>
+events-fetch <public-key> <kinds> <relays> <filter-options>
 <rumors> | rumors-info
 <private-key> | dm-events <public-key> <message>
 <private-key> | dm-fetch <relays>
@@ -592,7 +592,7 @@ events is a list of signed json nostr events
 rumors is a list of signed or unsiged json nostr events
 relays is a json array of string urls
 metadata-json is a json object that is parsed as metadata (nip-01, nip-24)
-relay-types is a json array of kinds (uint)
+kinds is a json array of kinds (uint)
 filter-options is a json object that can have fields since and until
 messages is a list of json object messages
 "#

@@ -1,6 +1,6 @@
 #!/bin/sh
 
-alias fzf="fzy"
+# alias fzf="fzy"
 
 dm_fetch_save() {
     if [ "$#" -lt 1 ]; then
