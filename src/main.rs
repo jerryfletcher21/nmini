@@ -53,7 +53,7 @@ fn path_exists(path: &str) -> bool {
 }
 
 fn mkdir(path: &str) -> Result<(), Error> {
-    std::fs::create_dir_all(std::path::PathBuf::from(&path))?;
+    std::fs::create_dir(std::path::PathBuf::from(&path))?;
 
     Ok(())
 }
@@ -62,15 +62,7 @@ fn file_write(file_name: &str, content: &str) -> Result<(), Error> {
     Ok(std::fs::write(file_name, content)?)
 }
 
-fn json_to_string_pretty<T: ?Sized>(json_value: &T) -> String
-where
-    T: serde::ser::Serialize
-{
-    serde_json::to_string_pretty(&json_value)
-        .unwrap_or_else(|_| format!("error: getting json string pretty"))
-}
-
-fn read_stdin_pipe() -> Result<String, Error> {
+fn stdin_pipe_read() -> Result<String, Error> {
     let mut input = std::io::stdin();
 
     if input.is_terminal() {
@@ -188,7 +180,7 @@ fn unsigned_event_print(
         event_json.extend(extra_fields);
     }
 
-    println!("{}", json_to_string_pretty(&event_json));
+    println!("{}", serde_json::to_string_pretty(&event_json)?);
 
     Ok(())
 }
@@ -433,7 +425,8 @@ fn dm_save(
     let self_public_key = PublicKey::parse(public_key)?;
 
     if ! path_exists(dir_save) {
-        mkdir(dir_save)?;
+        mkdir(dir_save)
+            .with_context(|| "creating save directory")?;
     }
 
     for message in messages {
@@ -480,7 +473,8 @@ fn dm_save(
 
         let peer_dir = format!("{dir_save}/{peer_bech32}");
         if ! path_exists(&peer_dir) {
-            mkdir(&peer_dir)?;
+            mkdir(&peer_dir)
+                .with_context(|| "creating peer directory")?;
         }
 
         let message_id = message.get("id")
@@ -502,7 +496,7 @@ fn dm_save(
         let message_file = format!("{peer_dir}/{created_at}-{message_id}");
         if ! path_exists(&message_file) {
             file_write(
-                &message_file, &(json_to_string_pretty(&message) + "\n")
+                &message_file, &(serde_json::to_string_pretty(&message)? + "\n")
             )?;
         }
     }
@@ -517,7 +511,7 @@ where
     let mut events: Vec<T> = Vec::new();
 
     for event in serde_json::Deserializer::from_str(
-        &read_stdin_pipe()
+        &stdin_pipe_read()
             .with_context(|| "reading events in stdin")?
     ).into_iter() {
         events.push(event
@@ -529,7 +523,7 @@ where
 }
 
 fn stdin_key() -> Result<String, Error> {
-    Ok(read_stdin_pipe()
+    Ok(stdin_pipe_read()
         .with_context(|| "reading key in stdin")?
         .trim()
         .to_owned()
@@ -711,7 +705,7 @@ messages is a list of json object messages
 
                 let mut messages: Vec<JsonOrdered> = Vec::new();
                 for message in serde_json::Deserializer::from_str(
-                    &read_stdin_pipe()
+                    &stdin_pipe_read()
                         .with_context(|| "reading messages in stdin")?
                 ).into_iter() {
                     messages.push(message

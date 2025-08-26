@@ -97,4 +97,8 @@ case "$action" in
     chat-find-show)
         chat_find_show "$@"
     ;;
+    *)
+        echo "error: action $action not found" >&2
+        exit 1
+    ;;
 esac
